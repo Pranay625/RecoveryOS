@@ -1,759 +1,593 @@
+
 """
-Generate coherent synthetic data for RecoveryOS.
+RecoveryOS - Synthetic Data Generator
 
-The generator creates:
-    - customers
-    - historical payments
-    - recovery attempts
-    - audit logs
+Generates coherent synthetic data for:
+    customers
+    payments
+    recovery_attempts
+    audit_logs
 
-The data is generated as a connected behavioral simulation rather than
-as independent random rows.
-
-Important:
-    recovery_attempt.ml_probability is synthetic simulator metadata.
-    It MUST NOT be used as an ML training feature.
-
-Usage from backend/:
-
-    python -m scripts.generate_synthetic_data --customers 10 --seed 42 --clear
+Run from backend/:
 
     python -m scripts.generate_synthetic_data --customers 1000 --seed 42 --clear
-"""
 
-from __future__ import annotations
+Important data semantics:
+    payments.status
+        = outcome of the payment attempt represented by that payment row.
+
+    recovery_attempts.status
+        = outcome of the RecoveryOS intervention.
+
+Therefore:
+    payment.status = "failed"
+    recovery_attempt.status = "completed"
+
+is valid. It means the original payment attempt failed,
+but RecoveryOS subsequently recovered the payment.
+
+ml_probability is simulator metadata only.
+It must NEVER be used as an ML training feature.
+"""
 
 import argparse
 import random
-import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal
-from pathlib import Path
-import sys
 
-# ---------------------------------------------------------------------------
-# Make the project root importable when this script is executed as a module.
-# ---------------------------------------------------------------------------
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-
-from sqlalchemy import delete, select
-from sqlalchemy.orm import Session
+from sqlalchemy import delete
 
 from app.db.session import SessionLocal
-from app.models.customer import Customer
-from app.models.payment import Payment
-from app.models.recovery_attempt import RecoveryAttempt
-from app.models.audit_log import AuditLog
+from app.models import (
+    Customer,
+    Payment,
+    RecoveryAttempt,
+    AuditLog,
+)
 
 
-# ===========================================================================
-# Configuration
-# ===========================================================================
-
-DEFAULT_CUSTOMERS = 1000
-
-CURRENCIES = ["INR"]
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 PAYMENT_METHODS = [
-    "card",
     "upi",
+    "card",
     "netbanking",
     "wallet",
 ]
 
 FAILURE_REASONS = [
-    "network_error",
     "insufficient_funds",
     "bank_declined",
+    "network_error",
     "authentication_failed",
     "expired_card",
 ]
 
+CURRENCIES = ["INR"]
 
-# ===========================================================================
-# Customer behavioral profiles
-# ===========================================================================
+PROFILE_TYPES = [
+    "reliable",
+    "frequent",
+    "inconsistent",
+    "high_risk",
+    "high_value",
+]
+
+
+# ============================================================
+# CUSTOMER PROFILES
+# ============================================================
 
 PROFILES = {
     "reliable": {
-        "reliability": 0.93,
-        "activity": (25, 55),
-        "spending_multiplier": 1.0,
-        "retry_response": 0.82,
-        "reminder_response": 0.62,
+        "payment_count_range": (20, 60),
+        "success_probability": 0.90,
+        "recovery_probability": 0.80,
+        "failure_weights": {
+            "insufficient_funds": 0.10,
+            "bank_declined": 0.20,
+            "network_error": 0.30,
+            "authentication_failed": 0.25,
+            "expired_card": 0.15,
+        },
+        "amount_range": (500, 10000),
     },
+
     "frequent": {
-        "reliability": 0.90,
-        "activity": (45, 70),
-        "spending_multiplier": 0.90,
-        "retry_response": 0.78,
-        "reminder_response": 0.72,
+        "payment_count_range": (40, 70),
+        "success_probability": 0.84,
+        "recovery_probability": 0.75,
+        "failure_weights": {
+            "insufficient_funds": 0.25,
+            "bank_declined": 0.15,
+            "network_error": 0.30,
+            "authentication_failed": 0.20,
+            "expired_card": 0.10,
+        },
+        "amount_range": (200, 6000),
     },
+
     "inconsistent": {
-        "reliability": 0.72,
-        "activity": (20, 50),
-        "spending_multiplier": 0.85,
-        "retry_response": 0.55,
-        "reminder_response": 0.50,
+        "payment_count_range": (15, 45),
+        "success_probability": 0.68,
+        "recovery_probability": 0.55,
+        "failure_weights": {
+            "insufficient_funds": 0.30,
+            "bank_declined": 0.25,
+            "network_error": 0.20,
+            "authentication_failed": 0.15,
+            "expired_card": 0.10,
+        },
+        "amount_range": (500, 12000),
     },
+
     "high_risk": {
-        "reliability": 0.55,
-        "activity": (15, 40),
-        "spending_multiplier": 0.75,
-        "retry_response": 0.35,
-        "reminder_response": 0.30,
+        "payment_count_range": (15, 40),
+        "success_probability": 0.50,
+        "recovery_probability": 0.35,
+        "failure_weights": {
+            "insufficient_funds": 0.40,
+            "bank_declined": 0.30,
+            "network_error": 0.10,
+            "authentication_failed": 0.15,
+            "expired_card": 0.05,
+        },
+        "amount_range": (300, 8000),
     },
+
     "high_value": {
-        "reliability": 0.84,
-        "activity": (18, 45),
-        "spending_multiplier": 2.2,
-        "retry_response": 0.72,
-        "reminder_response": 0.58,
+        "payment_count_range": (10, 30),
+        "success_probability": 0.78,
+        "recovery_probability": 0.65,
+        "failure_weights": {
+            "insufficient_funds": 0.20,
+            "bank_declined": 0.30,
+            "network_error": 0.20,
+            "authentication_failed": 0.20,
+            "expired_card": 0.10,
+        },
+        "amount_range": (10000, 100000),
     },
 }
 
 
-# ===========================================================================
-# Utility functions
-# ===========================================================================
-
-def generate_id(prefix: str) -> str:
-    """Generate a compact prefixed identifier."""
-    return f"{prefix}_{uuid.uuid4().hex[:12]}"
-
-
-def clamp(value: float, minimum: float, maximum: float) -> float:
-    return max(minimum, min(maximum, value))
-
-
-def choose_weighted(
-    rng: random.Random,
-    values: list[str],
-    weights: list[float],
-) -> str:
-    return rng.choices(values, weights=weights, k=1)[0]
-
-
-def generate_amount(
-    rng: random.Random,
-    spending_multiplier: float,
-) -> Decimal:
-    """
-    Generate a transaction amount with a long-tail distribution.
-
-    Values are intentionally bounded so synthetic data remains reasonable
-    for a payment-recovery demo.
-    """
-
-    base = rng.lognormvariate(7.7, 0.75)
-    amount = base * spending_multiplier
-
-    amount = clamp(amount, 100.0, 15000.0)
-
-    return Decimal(str(round(amount, 2)))
-
-
-def choose_payment_method(
-    rng: random.Random,
-    profile_name: str,
-) -> str:
-    """
-    Slightly vary payment-method preference by customer profile.
-    """
-
-    if profile_name == "reliable":
-        weights = [0.35, 0.40, 0.15, 0.10]
-
-    elif profile_name == "frequent":
-        weights = [0.30, 0.45, 0.15, 0.10]
-
-    elif profile_name == "inconsistent":
-        weights = [0.40, 0.30, 0.15, 0.15]
-
-    elif profile_name == "high_risk":
-        weights = [0.45, 0.25, 0.15, 0.15]
-
-    else:  # high_value
-        weights = [0.50, 0.25, 0.20, 0.05]
-
-    return choose_weighted(rng, PAYMENT_METHODS, weights)
-
-
-def choose_failure_reason(
-    rng: random.Random,
-    payment_method: str,
-    profile_name: str,
-) -> str:
-    """
-    Generate a failure reason with some relationship to payment method.
-    """
-
-    if payment_method == "card":
-        reasons = [
-            "bank_declined",
-            "expired_card",
-            "authentication_failed",
-            "insufficient_funds",
-            "network_error",
-        ]
-
-        weights = [
-            0.30,
-            0.12,
-            0.18,
-            0.25,
-            0.15,
-        ]
-
-    elif payment_method == "upi":
-        reasons = [
-            "insufficient_funds",
-            "bank_declined",
-            "authentication_failed",
-            "network_error",
-        ]
-
-        weights = [
-            0.30,
-            0.25,
-            0.10,
-            0.35,
-        ]
-
-    elif payment_method == "netbanking":
-        reasons = [
-            "bank_declined",
-            "authentication_failed",
-            "network_error",
-            "insufficient_funds",
-        ]
-
-        weights = [
-            0.30,
-            0.20,
-            0.35,
-            0.15,
-        ]
-
-    else:  # wallet
-        reasons = [
-            "insufficient_funds",
-            "authentication_failed",
-            "network_error",
-            "bank_declined",
-        ]
-
-        weights = [
-            0.30,
-            0.15,
-            0.40,
-            0.15,
-        ]
-
-    # High-risk customers get a slightly greater chance of
-    # financial/issuer-related failures.
-    if profile_name == "high_risk":
-        adjusted = list(weights)
-
-        for index, reason in enumerate(reasons):
-            if reason in {"bank_declined", "insufficient_funds"}:
-                adjusted[index] += 0.05
-
-        total = sum(adjusted)
-        weights = [weight / total for weight in adjusted]
-
-    return choose_weighted(rng, reasons, weights)
-
-
-def calculate_payment_success_probability(
-    rng: random.Random,
-    profile_name: str,
-    payment_method: str,
-    amount: Decimal,
-) -> float:
-    """
-    Generate a payment success probability.
-
-    This is part of the synthetic world model only.
-    """
-
-    profile = PROFILES[profile_name]
-
-    probability = profile["reliability"]
-
-    # Payment-method effects.
-    if payment_method == "upi":
-        probability += 0.015
-
-    elif payment_method == "card":
-        probability += 0.005
-
-    elif payment_method == "netbanking":
-        probability -= 0.015
-
-    elif payment_method == "wallet":
-        probability -= 0.010
-
-    # Very large payments are slightly more likely to fail.
-    if amount >= 10000:
-        probability -= 0.04
-
-    elif amount >= 5000:
-        probability -= 0.02
-
-    # Small random variation.
-    probability += rng.uniform(-0.025, 0.025)
-
-    return clamp(probability, 0.20, 0.98)
-
-
-def calculate_recovery_probability(
-    profile_name: str,
-    action: str,
-    failure_reason: str,
-    attempt_number: int,
-    amount: Decimal,
-) -> float:
-    """
-    Generate the hidden probability used by the simulator to decide
-    whether a recovery attempt succeeds.
-
-    IMPORTANT:
-        This probability is NOT an ML feature.
-        It represents the synthetic ground-truth mechanism.
-    """
-
-    profile = PROFILES[profile_name]
-
-    if action == "PAYMENT_RETRY":
-        probability = profile["retry_response"]
-
-    elif action == "SEND_REMINDER":
-        probability = profile["reminder_response"]
-
-    else:
-        return 0.0
-
-    # Failure-specific effects.
-    if failure_reason == "network_error":
-        probability += 0.12 if action == "PAYMENT_RETRY" else 0.02
-
-    elif failure_reason == "insufficient_funds":
-        probability -= 0.08 if action == "PAYMENT_RETRY" else 0.02
-
-    elif failure_reason == "bank_declined":
-        probability -= 0.05
-
-    elif failure_reason == "authentication_failed":
-        probability -= 0.12 if action == "PAYMENT_RETRY" else 0.04
-
-    elif failure_reason == "expired_card":
-        probability -= 0.25 if action == "PAYMENT_RETRY" else 0.08
-
-    # Repeated attempts become less effective.
-    if attempt_number >= 2:
-        probability -= 0.12
-
-    # Very high-value payments are slightly harder to recover automatically.
-    if amount >= 10000:
-        probability -= 0.04
-
-    return clamp(probability, 0.05, 0.95)
-
-
-def choose_recovery_action(
-    rng: random.Random,
-    profile_name: str,
-    failure_reason: str,
-) -> str:
-    """
-    Choose a historical recovery action for the simulator.
-
-    This is not the future LLM decision.
-    The future system will decide using:
-        XGBoost → Grok → Policy Engine.
-    """
-
-    profile = PROFILES[profile_name]
-
-    retry_weight = profile["retry_response"]
-    reminder_weight = profile["reminder_response"]
-
-    if failure_reason == "network_error":
-        retry_weight += 0.20
-
-    elif failure_reason == "expired_card":
-        retry_weight -= 0.30
-        reminder_weight += 0.10
-
-    elif failure_reason == "insufficient_funds":
-        reminder_weight += 0.15
-
-    return choose_weighted(
-        rng,
-        ["PAYMENT_RETRY", "SEND_REMINDER"],
-        [max(retry_weight, 0.05), max(reminder_weight, 0.05)],
-    )
-
-
-# ===========================================================================
-# Customer generation
-# ===========================================================================
-
-def generate_customer_profile(rng: random.Random) -> str:
-    profile_names = list(PROFILES.keys())
-
-    weights = [
-        0.30,  # reliable
-        0.20,  # frequent
-        0.20,  # inconsistent
-        0.15,  # high risk
-        0.15,  # high value
-    ]
-
-    return choose_weighted(rng, profile_names, weights)
-
-
-def generate_customer_name(
-    rng: random.Random,
-    customer_number: int,
-) -> str:
-    """
-    Lightweight deterministic synthetic names.
-
-    Faker is deliberately not required because names are not ML features.
-    """
-
+# ============================================================
+# HELPERS
+# ============================================================
+
+def weighted_choice(weights: dict) -> str:
+    """Choose one item using a dictionary of probabilities."""
+    items = list(weights.keys())
+    probabilities = list(weights.values())
+    return random.choices(items, weights=probabilities, k=1)[0]
+
+
+def generate_customer_name(index: int) -> str:
+    """Generate deterministic synthetic customer names."""
     first_names = [
         "Arun",
-        "Vikram",
         "Rahul",
-        "Karan",
+        "Vikram",
+        "Kiran",
         "Aditya",
         "Rohan",
-        "Aman",
         "Nikhil",
         "Varun",
+        "Aman",
         "Sanjay",
-        "Priya",
-        "Ananya",
-        "Sneha",
-        "Meera",
-        "Kavya",
-        "Divya",
-        "Neha",
-        "Isha",
-        "Pooja",
-        "Aditi",
     ]
 
     last_names = [
         "Sharma",
-        "Reddy",
         "Kumar",
+        "Reddy",
         "Patel",
         "Rao",
-        "Nair",
-        "Iyer",
-        "Mehta",
         "Singh",
+        "Mehta",
+        "Iyer",
+        "Nair",
         "Verma",
     ]
 
-    return (
-        f"{rng.choice(first_names)} "
-        f"{rng.choice(last_names)} "
-        f"{customer_number}"
+    first = first_names[index % len(first_names)]
+    last = last_names[(index // len(first_names)) % len(last_names)]
+
+    return f"{first} {last}"
+
+
+def generate_amount(profile: dict) -> Decimal:
+    low, high = profile["amount_range"]
+
+    amount = random.uniform(low, high)
+
+    # Round to nearest 50 for more realistic transaction amounts.
+    amount = round(amount / 50) * 50
+
+    return Decimal(str(amount)).quantize(Decimal("0.01"))
+
+
+def generate_payment_method() -> str:
+    return random.choice(PAYMENT_METHODS)
+
+
+def generate_payment_id(index: int) -> str:
+    return f"PAY_{index:08d}"
+
+
+def generate_recovery_id(index: int) -> str:
+    return f"REC_{index:08d}"
+
+
+def generate_audit_id(index: int) -> str:
+    return f"AUD_{index:08d}"
+
+
+# ============================================================
+# RECOVERY SIMULATION
+# ============================================================
+
+def simulate_recovery(
+    profile: dict,
+    failure_reason: str,
+    attempt_number: int,
+) -> tuple[str, float, str]:
+    """
+    Simulate RecoveryOS intervention outcome.
+
+    Returns:
+        action
+        ml_probability
+        status
+    """
+
+    base_probability = profile["recovery_probability"]
+
+    # Different failures respond differently to interventions.
+    retry_modifier = {
+        "network_error": 0.20,
+        "authentication_failed": 0.05,
+        "insufficient_funds": -0.05,
+        "bank_declined": -0.10,
+        "expired_card": -0.20,
+    }.get(failure_reason, 0.0)
+
+    reminder_modifier = {
+        "network_error": 0.05,
+        "authentication_failed": 0.10,
+        "insufficient_funds": 0.15,
+        "bank_declined": 0.05,
+        "expired_card": -0.15,
+    }.get(failure_reason, 0.0)
+
+    retry_probability = min(
+        max(base_probability + retry_modifier, 0.05),
+        0.95,
     )
 
+    reminder_probability = min(
+        max(base_probability + reminder_modifier, 0.05),
+        0.95,
+    )
 
-# ===========================================================================
-# Database cleanup
-# ===========================================================================
+    # Avoid repeatedly retrying.
+    if attempt_number >= 2:
+        action = "SEND_REMINDER"
+        probability = reminder_probability
+    else:
+        # Simulate the recovery system choosing between interventions.
+        if retry_probability >= reminder_probability:
+            action = "PAYMENT_RETRY"
+            probability = retry_probability
+        else:
+            action = "SEND_REMINDER"
+            probability = reminder_probability
 
-def clear_existing_data(session: Session) -> None:
-    """
-    Delete existing records in dependency order.
+    # Small penalty for repeated attempts.
+    probability -= (attempt_number - 1) * 0.10
+    probability = min(max(probability, 0.05), 0.95)
 
-    --clear means the generated dataset becomes the total dataset.
-    """
+    status = (
+        "completed"
+        if random.random() < probability
+        else "failed"
+    )
 
-    print("Clearing existing synthetic data...")
-
-    session.execute(delete(AuditLog))
-    session.execute(delete(RecoveryAttempt))
-    session.execute(delete(Payment))
-    session.execute(delete(Customer))
-
-    session.commit()
-
-    print("Existing customer/payment/recovery/audit data cleared.")
+    return action, round(probability, 4), status
 
 
-# ===========================================================================
-# Main generation logic
-# ===========================================================================
+# ============================================================
+# MAIN GENERATOR
+# ============================================================
 
-def generate_dataset(
-    session: Session,
+def generate_data(
     customer_count: int,
     seed: int,
-) -> dict[str, int]:
+    clear_existing: bool,
+):
+    random.seed(seed)
 
-    rng = random.Random(seed)
+    db = SessionLocal()
 
-    reference_time = datetime.now()
+    try:
+        # ----------------------------------------------------
+        # CLEAR EXISTING DATA
+        # ----------------------------------------------------
 
-    counts = {
-        "customers": 0,
-        "payments": 0,
-        "captured_payments": 0,
-        "failed_payments": 0,
-        "recovery_attempts": 0,
-        "successful_recoveries": 0,
-        "failed_recoveries": 0,
-        "audit_logs": 0,
-    }
+        if clear_existing:
+            print("Clearing existing synthetic data...")
 
-    for customer_number in range(1, customer_count + 1):
+            db.execute(delete(AuditLog))
+            db.execute(delete(RecoveryAttempt))
+            db.execute(delete(Payment))
+            db.execute(delete(Customer))
 
-        # ---------------------------------------------------------------
-        # 1. Create latent customer behavioral profile.
-        #
-        # This is intentionally NOT stored in the database.
-        # It is only used by the simulator to create correlated behavior.
-        # ---------------------------------------------------------------
+            db.commit()
 
-        profile_name = generate_customer_profile(rng)
-        profile = PROFILES[profile_name]
+        # ----------------------------------------------------
+        # COUNTERS
+        # ----------------------------------------------------
 
-        customer_id = generate_id("CUST")
+        payment_counter = 1
+        recovery_counter = 1
+        audit_counter = 1
 
-        customer = Customer(
-            customer_id=customer_id,
-            name=generate_customer_name(rng, customer_number),
-            email=f"customer{customer_number}@example.com",
-            contact=f"+919000{customer_number:06d}",
-            created_at=reference_time - timedelta(days=rng.randint(180, 365)),
-            recovery_opt_out=False,
-        )
+        customers_created = 0
+        payments_created = 0
+        recoveries_created = 0
+        audits_created = 0
 
-        session.add(customer)
+        # ----------------------------------------------------
+        # GENERATE CUSTOMERS
+        # ----------------------------------------------------
 
-        counts["customers"] += 1
+        for customer_index in range(1, customer_count + 1):
 
-        # ---------------------------------------------------------------
-        # 2. Generate chronological payment history.
-        # ---------------------------------------------------------------
+            customer_id = f"CUST_{customer_index:06d}"
 
-        transaction_count = rng.randint(
-            profile["activity"][0],
-            profile["activity"][1],
-        )
+            profile_type = random.choice(PROFILE_TYPES)
+            profile = PROFILES[profile_type]
 
-        # Generate timestamps first so the history is chronological.
-        timestamps = []
-
-        for _ in range(transaction_count):
-            days_ago = rng.uniform(0, 180)
-            timestamp = reference_time - timedelta(days=days_ago)
-            timestamps.append(timestamp)
-
-        timestamps.sort()
-
-        for payment_index, payment_time in enumerate(timestamps):
-
-            amount = generate_amount(
-                rng,
-                profile["spending_multiplier"],
-            )
-
-            payment_method = choose_payment_method(
-                rng,
-                profile_name,
-            )
-
-            success_probability = calculate_payment_success_probability(
-                rng,
-                profile_name,
-                payment_method,
-                amount,
-            )
-
-            captured = rng.random() < success_probability
-
-            payment_id = generate_id("PAY")
-
-            if captured:
-                status = "captured"
-                failure_reason = None
-
-            else:
-                status = "failed"
-
-                failure_reason = choose_failure_reason(
-                    rng,
-                    payment_method,
-                    profile_name,
-                )
-
-            payment = Payment(
-                payment_id=payment_id,
+            customer = Customer(
                 customer_id=customer_id,
-                razorpay_order_id=None,
-                razorpay_payment_id=None,
-                amount=amount,
-                currency="INR",
-                payment_method=payment_method,
-                status=status,
-                failure_reason=failure_reason,
-                attempt_number=1,
-                created_at=payment_time,
+                name=generate_customer_name(customer_index),
+                email=f"customer{customer_index}@example.com",
+                contact=f"90000{customer_index:05d}",
+                recovery_opt_out=False,
             )
 
-            session.add(payment)
+            db.add(customer)
 
-            counts["payments"] += 1
+            customers_created += 1
 
-            if captured:
-                counts["captured_payments"] += 1
-                continue
+            # ------------------------------------------------
+            # PAYMENT HISTORY
+            # ------------------------------------------------
 
-            counts["failed_payments"] += 1
+            payment_count = random.randint(
+                *profile["payment_count_range"]
+            )
 
-            # -----------------------------------------------------------
-            # 3. Failed payments may receive recovery attempts.
-            # -----------------------------------------------------------
+            # Spread transactions across approximately 6 months.
+            start_date = datetime.utcnow() - timedelta(days=180)
 
-            # Some failures receive no automated recovery at all.
-            if rng.random() > 0.75:
-                continue
+            previous_payments = []
 
-            recovery_attempt_count = 1
+            for payment_index in range(payment_count):
 
-            # A subset gets a second recovery attempt.
-            if rng.random() < 0.30:
-                recovery_attempt_count = 2
+                created_at = start_date + timedelta(
+                    days=random.randint(0, 180),
+                    hours=random.randint(0, 23),
+                    minutes=random.randint(0, 59),
+                )
 
-            previous_action = None
+                amount = generate_amount(profile)
+                payment_method = generate_payment_method()
 
-            for recovery_index in range(recovery_attempt_count):
+                is_successful = (
+                    random.random()
+                    < profile["success_probability"]
+                )
 
-                attempt_number = recovery_index + 1
+                # --------------------------------------------
+                # SUCCESSFUL PAYMENT
+                # --------------------------------------------
 
-                # If there is a second attempt, prefer the alternate action.
-                if recovery_index == 0:
-                    action = choose_recovery_action(
-                        rng,
-                        profile_name,
-                        failure_reason,
+                if is_successful:
+
+                    payment = Payment(
+                        payment_id=generate_payment_id(payment_counter),
+                        customer_id=customer_id,
+                        razorpay_order_id=None,
+                        razorpay_payment_id=None,
+                        amount=amount,
+                        currency="INR",
+                        payment_method=payment_method,
+                        status="captured",
+                        failure_reason=None,
+                        attempt_number=1,
+                        created_at=created_at,
                     )
-                else:
-                    action = (
-                        "SEND_REMINDER"
-                        if previous_action == "PAYMENT_RETRY"
-                        else "PAYMENT_RETRY"
+
+                    db.add(payment)
+
+                    previous_payments.append(payment)
+
+                    payment_counter += 1
+                    payments_created += 1
+
+                    continue
+
+                # --------------------------------------------
+                # FAILED PAYMENT
+                # --------------------------------------------
+
+                failure_reason = weighted_choice(
+                    profile["failure_weights"]
+                )
+
+                payment = Payment(
+                    payment_id=generate_payment_id(payment_counter),
+                    customer_id=customer_id,
+                    razorpay_order_id=None,
+                    razorpay_payment_id=None,
+                    amount=amount,
+                    currency="INR",
+                    payment_method=payment_method,
+                    status="failed",
+                    failure_reason=failure_reason,
+                    attempt_number=1,
+                    created_at=created_at,
+                )
+
+                db.add(payment)
+                previous_payments.append(payment)
+
+                payment_counter += 1
+                payments_created += 1
+
+                # --------------------------------------------
+                # RECOVERY ATTEMPTS
+                # --------------------------------------------
+
+                max_recovery_attempts = random.choice([1, 1, 1, 2])
+
+                recovery_succeeded = False
+
+                for attempt_number in range(
+                    1,
+                    max_recovery_attempts + 1,
+                ):
+
+                    if recovery_succeeded:
+                        break
+
+                    action, probability, recovery_status = (
+                        simulate_recovery(
+                            profile=profile,
+                            failure_reason=failure_reason,
+                            attempt_number=attempt_number,
+                        )
                     )
 
-                previous_action = action
+                    recovery_id = generate_recovery_id(
+                        recovery_counter
+                    )
 
-                recovery_probability = calculate_recovery_probability(
-                    profile_name,
-                    action,
-                    failure_reason,
-                    attempt_number,
-                    amount,
+                    recovery_created_at = created_at + timedelta(
+                        minutes=random.randint(5, 240)
+                    )
+
+                    completed_at = (
+                        recovery_created_at
+                        + timedelta(minutes=random.randint(1, 30))
+                        if recovery_status == "completed"
+                        else None
+                    )
+
+                    recovery_attempt = RecoveryAttempt(
+                        recovery_id=recovery_id,
+                        payment_id=payment.payment_id,
+                        action=action,
+                        reason=(
+                            f"Synthetic recovery simulation for "
+                            f"{failure_reason}"
+                        ),
+                        ml_probability=Decimal(
+                            str(probability)
+                        ),
+                        status=recovery_status,
+                        created_at=recovery_created_at,
+                        completed_at=completed_at,
+                    )
+
+                    db.add(recovery_attempt)
+
+                    recoveries_created += 1
+
+                    # ----------------------------------------
+                    # AUDIT LOG
+                    # ----------------------------------------
+
+                    audit_event = (
+                        "recovery_completed"
+                        if recovery_status == "completed"
+                        else "recovery_failed"
+                    )
+
+                    policy_result = (
+                        "approved"
+                        if recovery_status == "completed"
+                        else "approved_execution_failed"
+                    )
+
+                    audit_log = AuditLog(
+                        audit_id=generate_audit_id(audit_counter),
+                        payment_id=payment.payment_id,
+                        recovery_id=recovery_id,
+                        event=audit_event,
+                        agent_reason=(
+                            f"Selected {action} for "
+                            f"{failure_reason}"
+                        ),
+                        policy_result=policy_result,
+                        timestamp=recovery_created_at,
+                    )
+
+                    db.add(audit_log)
+
+                    audits_created += 1
+
+                    recovery_counter += 1
+                    audit_counter += 1
+
+                    # ----------------------------------------
+                    # STOP AFTER SUCCESS
+                    # ----------------------------------------
+
+                    if recovery_status == "completed":
+                        recovery_succeeded = True
+
+            # ------------------------------------------------
+            # COMMIT CUSTOMER BATCH
+            # ------------------------------------------------
+
+            db.commit()
+
+            if customer_index % 100 == 0:
+                print(
+                    f"Generated {customer_index}/"
+                    f"{customer_count} customers..."
                 )
 
-                recovered = rng.random() < recovery_probability
+        # ----------------------------------------------------
+        # SUMMARY
+        # ----------------------------------------------------
 
-                recovery_id = generate_id("REC")
+        print("\nSynthetic data generation complete.")
+        print("--------------------------------")
+        print(f"Customers created       : {customers_created}")
+        print(f"Payments created        : {payments_created}")
+        print(f"Recovery attempts       : {recoveries_created}")
+        print(f"Audit logs created      : {audits_created}")
+        print("--------------------------------")
+        print(f"Random seed             : {seed}")
 
-                # Recovery is simulated some time after the payment failure.
-                recovery_created_at = payment_time + timedelta(
-                    hours=rng.randint(1, 48),
-                    minutes=rng.randint(0, 59),
-                )
+    except Exception:
+        db.rollback()
+        raise
 
-                recovery_completed_at = recovery_created_at + timedelta(
-                    minutes=rng.randint(1, 30)
-                )
-
-                # -------------------------------------------------------
-                # IMPORTANT:
-                #
-                # ml_probability is simulator metadata.
-                # It represents the hidden probability used to generate
-                # the synthetic outcome.
-                #
-                # It MUST NOT be included in ML training features.
-                # -------------------------------------------------------
-
-                recovery_attempt = RecoveryAttempt(
-                    recovery_id=recovery_id,
-                    payment_id=payment_id,
-                    action=action,
-                    reason=f"synthetic_{failure_reason}",
-                    ml_probability=round(
-                        recovery_probability,
-                        4,
-                    ),
-                    status="completed" if recovered else "failed",
-                    created_at=recovery_created_at,
-                    completed_at=recovery_completed_at,
-                )
-
-                session.add(recovery_attempt)
-
-                counts["recovery_attempts"] += 1
-
-                if recovered:
-                    counts["successful_recoveries"] += 1
-                    recovery_event = "recovery_succeeded"
-                else:
-                    counts["failed_recoveries"] += 1
-                    recovery_event = "recovery_failed"
-
-                # -------------------------------------------------------
-                # 4. Audit log for every recovery attempt.
-                # -------------------------------------------------------
-
-                audit_log = AuditLog(
-                    audit_id=generate_id("AUD"),
-                    payment_id=payment_id,
-                    recovery_id=recovery_id,
-                    event=recovery_event,
-                    agent_reason=(
-                        f"Synthetic historical recovery using {action} "
-                        f"for failure reason {failure_reason}."
-                    ),
-                    policy_result="approved",
-                    timestamp=recovery_completed_at,
-                )
-
-                session.add(audit_log)
-
-                counts["audit_logs"] += 1
-
-                # If the first recovery succeeds, stop additional recovery.
-                if recovered:
-                    break
-
-    session.commit()
-
-    return counts
+    finally:
+        db.close()
 
 
-# ===========================================================================
+# ============================================================
 # CLI
-# ===========================================================================
+# ============================================================
 
-def parse_args() -> argparse.Namespace:
+def main():
     parser = argparse.ArgumentParser(
         description="Generate synthetic RecoveryOS data."
     )
@@ -761,7 +595,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--customers",
         type=int,
-        default=DEFAULT_CUSTOMERS,
+        default=1000,
         help="Number of customers to generate.",
     )
 
@@ -775,71 +609,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--clear",
         action="store_true",
-        help="Clear existing customer/payment/recovery/audit data first.",
+        help="Clear existing data before generation.",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
 
-
-def main() -> None:
-    args = parse_args()
-
-    if args.customers <= 0:
-        raise ValueError("--customers must be greater than 0.")
-
-    print("=" * 70)
-    print("RecoveryOS Synthetic Data Generator")
-    print("=" * 70)
-    print(f"Customers requested : {args.customers}")
-    print(f"Random seed         : {args.seed}")
-    print(f"Clear existing data : {args.clear}")
-    print()
-
-    session = SessionLocal()
-
-    try:
-        if args.clear:
-            clear_existing_data(session)
-
-        counts = generate_dataset(
-            session=session,
-            customer_count=args.customers,
-            seed=args.seed,
-        )
-
-        print()
-        print("=" * 70)
-        print("Generation complete")
-        print("=" * 70)
-
-        print(f"Customers           : {counts['customers']}")
-        print(f"Payments            : {counts['payments']}")
-        print(f"  Captured          : {counts['captured_payments']}")
-        print(f"  Failed            : {counts['failed_payments']}")
-        print(f"Recovery attempts   : {counts['recovery_attempts']}")
-        print(f"  Successful        : {counts['successful_recoveries']}")
-        print(f"  Failed            : {counts['failed_recoveries']}")
-        print(f"Audit logs          : {counts['audit_logs']}")
-
-        if counts["recovery_attempts"] > 0:
-            recovery_rate = (
-                counts["successful_recoveries"]
-                / counts["recovery_attempts"]
-            ) * 100
-
-            print(
-                f"Recovery success    : "
-                f"{recovery_rate:.2f}%"
-            )
-
-        print("=" * 70)
-
-    except Exception:
-        session.rollback()
-        raise
-
-    finally:
-        session.close()
+    generate_data(
+        customer_count=args.customers,
+        seed=args.seed,
+        clear_existing=args.clear,
+    )
 
 
 if __name__ == "__main__":

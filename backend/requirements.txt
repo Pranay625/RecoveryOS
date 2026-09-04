@@ -4,3 +4,7 @@ sqlalchemy
 pymysql
 pydantic-settings
 alembic
+pandas
+xgboost
+scikit-learn
+joblib

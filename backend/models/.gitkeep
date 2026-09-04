@@ -1,0 +1,3 @@
+# This directory contains trained model artifacts generated at runtime.
+# recovery_model.joblib and recovery_model_metadata.json are generated
+# by running: python -m scripts.train_recovery_model
