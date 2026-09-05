@@ -68,13 +68,20 @@ def test_send_reminder_allowed_normal_customer():
 
 
 # ---------------------------------------------------------------------------
-# 3. STOP recommendation passes through
+# 3. Unknown action falls back to ESCALATE (safety net)
 # ---------------------------------------------------------------------------
 
-def test_stop_recommendation_passes_through():
-    decision = evaluate(_rec("STOP"), _ctx())
-    assert decision.action == "STOP"
-    assert decision.allowed is True
+def test_unknown_action_falls_back_to_escalate():
+    """
+    The policy engine's fallback handles any action string not covered by
+    the explicit rules (e.g. a future action or a bug in the caller).
+    """
+    # Bypass Pydantic validation by constructing the object then mutating action
+    rec = _rec("ESCALATE")
+    object.__setattr__(rec, "action", "UNKNOWN_ACTION")
+    decision = evaluate(rec, _ctx())
+    assert decision.action == "ESCALATE"
+    assert decision.allowed is False
 
 
 # ---------------------------------------------------------------------------
@@ -197,15 +204,15 @@ def test_policy_engine_makes_no_external_calls():
 
 
 # ---------------------------------------------------------------------------
-# 12. Opt-out takes priority over STOP/ESCALATE recommendations
+# 12. Opt-out takes priority over ESCALATE recommendation
 # ---------------------------------------------------------------------------
 
-def test_opt_out_overrides_stop_recommendation():
+def test_opt_out_overrides_escalate_recommendation():
     """
-    Even if Gemini says STOP, opt-out rule fires first and sets allowed=False.
-    (Both result in STOP action, but allowed differs.)
+    Even if Gemini says ESCALATE, opt-out rule fires first and sets allowed=False.
+    (ESCALATE normally passes through as allowed=True, but opt-out overrides.)
     """
-    decision = evaluate(_rec("STOP"), _ctx(recovery_opt_out=True))
+    decision = evaluate(_rec("ESCALATE"), _ctx(recovery_opt_out=True))
     assert decision.action == "STOP"
     assert decision.allowed is False
 

@@ -59,19 +59,30 @@ Your job is to recommend the most appropriate recovery action for a failed \
 payment using ONLY the supplied payment context, customer history, and \
 XGBoost model predictions.
 
-Available actions:
+You MUST choose exactly one of these three actions:
 
 PAYMENT_RETRY:
-Recommend attempting payment recovery again.
+Recommend another automated payment retry. Use when the XGBoost retry \
+probability is strong, the customer has a good payment history, and \
+previous recovery attempts have not been exhausted.
 
 SEND_REMINDER:
-Recommend contacting/reminding the customer.
+Recommend contacting or reminding the customer. Use when a reminder is \
+more appropriate than an immediate retry, e.g. the customer has a \
+reasonable history but the retry probability is weak.
 
 ESCALATE:
-Recommend human review.
+Recommend human or manual intervention instead of another automated \
+recovery action. Use when:
+  - the recovery history is poor (low recovery success rate)
+  - repeated recovery attempts have already failed
+  - the customer has a strong pattern of unsuccessful recovery
+  - both XGBoost probabilities are weak or ambiguous (below ~0.5)
+  - the previous retry or reminder counts are high
+  - the situation clearly requires human judgement
+  - continuing automated recovery is unlikely to succeed
 
-STOP:
-Recommend no further automated recovery.
+Do NOT use any action name other than PAYMENT_RETRY, SEND_REMINDER, or ESCALATE.
 
 Rules:
 
@@ -131,7 +142,7 @@ class RecoveryContext(BaseModel):
 # Response model
 # ---------------------------------------------------------------------------
 
-RecoveryAction = Literal["PAYMENT_RETRY", "SEND_REMINDER", "ESCALATE", "STOP"]
+RecoveryAction = Literal["PAYMENT_RETRY", "SEND_REMINDER", "ESCALATE"]
 
 
 class RecoveryRecommendation(BaseModel):
@@ -172,6 +183,15 @@ Previous SEND_REMINDER count    : {ch.previous_reminder_count}
 === XGBOOST MODEL PREDICTIONS ===
 P(success | PAYMENT_RETRY)  : {ml.PAYMENT_RETRY:.4f}
 P(success | SEND_REMINDER)  : {ml.SEND_REMINDER:.4f}
+
+=== AVAILABLE ACTIONS ===
+PAYMENT_RETRY  - recommend another automated payment retry
+SEND_REMINDER  - recommend contacting/reminding the customer
+ESCALATE       - recommend human/manual intervention instead of another \
+automated recovery action
+
+Choose ESCALATE if the recovery history is poor, probabilities are weak \
+(below ~0.5), repeated attempts have failed, or human judgement is needed.
 
 Based on the above, recommend the single best recovery action.
 Return a structured response with action, reason, and confidence.\

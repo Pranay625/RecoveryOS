@@ -456,3 +456,144 @@ def test_new_customer_policy_allows_payment_retry():
     data = response.json()
     assert data["policy"]["action"] == "PAYMENT_RETRY"
     assert data["policy"]["allowed"] is True
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 additions — ESCALATE as a Gemini action
+# ---------------------------------------------------------------------------
+
+# 14. Gemini returns ESCALATE — policy allows it, recommended_action preserved
+def test_gemini_escalate_reaches_policy_and_is_allowed():
+    with patch("app.routers.recovery.build_inference_features",
+               return_value=MOCK_FEATURES_EXISTING), \
+         patch("app.routers.recovery.predict_recovery_probabilities",
+               return_value={"PAYMENT_RETRY": 0.42, "SEND_REMINDER": 0.39}), \
+         patch("app.routers.recovery._get_agent") as mock_get_agent, \
+         patch("app.routers.recovery.get_db") as mock_get_db:
+
+        mock_db = MagicMock()
+        mock_customer = MagicMock()
+        mock_customer.recovery_opt_out = False
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_customer
+        mock_get_db.return_value = iter([mock_db])
+
+        mock_agent = MagicMock()
+        mock_agent.recommend.return_value = MagicMock(
+            action="ESCALATE", confidence=0.70,
+            reason="Both probabilities are weak; human review needed."
+        )
+        mock_get_agent.return_value = mock_agent
+
+        response = client.post("/api/recovery/predict", json=VALID_REQUEST)
+
+    assert response.status_code == 200
+    data = response.json()
+    # Gemini recommendation preserved
+    assert data["recommended_action"] == "ESCALATE"
+    # Policy allows ESCALATE
+    assert data["policy"]["action"] == "ESCALATE"
+    assert data["policy"]["allowed"] is True
+
+
+# 15. Gemini returns SEND_REMINDER — policy allows it
+def test_gemini_send_reminder_policy_allows():
+    with patch("app.routers.recovery.build_inference_features",
+               return_value=MOCK_FEATURES_EXISTING), \
+         patch("app.routers.recovery.predict_recovery_probabilities",
+               return_value=MOCK_ML_PREDICTIONS), \
+         patch("app.routers.recovery._get_agent") as mock_get_agent, \
+         patch("app.routers.recovery.get_db") as mock_get_db:
+
+        mock_db = MagicMock()
+        mock_customer = MagicMock()
+        mock_customer.recovery_opt_out = False
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_customer
+        mock_get_db.return_value = iter([mock_db])
+
+        mock_agent = MagicMock()
+        mock_agent.recommend.return_value = MagicMock(
+            action="SEND_REMINDER", confidence=0.73, reason="reminder appropriate"
+        )
+        mock_get_agent.return_value = mock_agent
+
+        response = client.post("/api/recovery/predict", json=VALID_REQUEST)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["recommended_action"] == "SEND_REMINDER"
+    assert data["policy"]["action"] == "SEND_REMINDER"
+    assert data["policy"]["allowed"] is True
+
+
+# 16. Gemini recommends PAYMENT_RETRY but retry limit is reached — policy escalates
+def test_gemini_payment_retry_does_not_bypass_retry_limit():
+    features_at_retry_limit = {
+        **MOCK_FEATURES_EXISTING,
+        "previous_retry_count": 2,        # == MAX_PAYMENT_RETRIES
+        "previous_recovery_attempts": 2,
+    }
+
+    with patch("app.routers.recovery.build_inference_features",
+               return_value=features_at_retry_limit), \
+         patch("app.routers.recovery.predict_recovery_probabilities",
+               return_value=MOCK_ML_PREDICTIONS), \
+         patch("app.routers.recovery._get_agent") as mock_get_agent, \
+         patch("app.routers.recovery.get_db") as mock_get_db:
+
+        mock_db = MagicMock()
+        mock_customer = MagicMock()
+        mock_customer.recovery_opt_out = False
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_customer
+        mock_get_db.return_value = iter([mock_db])
+
+        mock_agent = MagicMock()
+        mock_agent.recommend.return_value = MagicMock(
+            action="PAYMENT_RETRY", confidence=0.88, reason="retry recommended"
+        )
+        mock_get_agent.return_value = mock_agent
+
+        response = client.post("/api/recovery/predict", json=VALID_REQUEST)
+
+    assert response.status_code == 200
+    data = response.json()
+    # Gemini said PAYMENT_RETRY but policy must block it
+    assert data["recommended_action"] == "PAYMENT_RETRY"
+    assert data["policy"]["action"] == "ESCALATE"
+    assert data["policy"]["allowed"] is False
+
+
+# 17. Gemini recommends SEND_REMINDER but reminder limit is reached — policy escalates
+def test_gemini_send_reminder_does_not_bypass_reminder_limit():
+    features_at_reminder_limit = {
+        **MOCK_FEATURES_EXISTING,
+        "previous_reminder_count": 2,     # == MAX_REMINDERS
+        "previous_recovery_attempts": 2,
+    }
+
+    with patch("app.routers.recovery.build_inference_features",
+               return_value=features_at_reminder_limit), \
+         patch("app.routers.recovery.predict_recovery_probabilities",
+               return_value=MOCK_ML_PREDICTIONS), \
+         patch("app.routers.recovery._get_agent") as mock_get_agent, \
+         patch("app.routers.recovery.get_db") as mock_get_db:
+
+        mock_db = MagicMock()
+        mock_customer = MagicMock()
+        mock_customer.recovery_opt_out = False
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_customer
+        mock_get_db.return_value = iter([mock_db])
+
+        mock_agent = MagicMock()
+        mock_agent.recommend.return_value = MagicMock(
+            action="SEND_REMINDER", confidence=0.72, reason="reminder recommended"
+        )
+        mock_get_agent.return_value = mock_agent
+
+        response = client.post("/api/recovery/predict", json=VALID_REQUEST)
+
+    assert response.status_code == 200
+    data = response.json()
+    # Gemini said SEND_REMINDER but policy must block it
+    assert data["recommended_action"] == "SEND_REMINDER"
+    assert data["policy"]["action"] == "ESCALATE"
+    assert data["policy"]["allowed"] is False

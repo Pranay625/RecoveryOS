@@ -88,11 +88,10 @@ def evaluate(
     Rules are evaluated in strict priority order:
 
         Rule 1  — Customer opt-out (highest priority)
-        Rule 2  — STOP recommendation
-        Rule 3  — ESCALATE recommendation
-        Rule 4  — Total recovery attempt limit
-        Rule 5  — PAYMENT_RETRY specific checks
-        Rule 6  — SEND_REMINDER specific checks
+        Rule 2  — ESCALATE recommendation
+        Rule 3  — Total recovery attempt limit
+        Rule 4  — PAYMENT_RETRY specific checks
+        Rule 5  — SEND_REMINDER specific checks
 
     The engine never modifies XGBoost probabilities or Gemini's reasoning.
     It only determines whether the recommended action is permitted.
@@ -114,17 +113,7 @@ def evaluate(
         )
 
     # ------------------------------------------------------------------
-    # Rule 2 — Gemini recommends STOP
-    # ------------------------------------------------------------------
-    if action == "STOP":
-        return PolicyDecision(
-            action="STOP",
-            allowed=True,
-            reason="No further automated recovery is recommended.",
-        )
-
-    # ------------------------------------------------------------------
-    # Rule 3 — Gemini recommends ESCALATE
+    # Rule 2 — Gemini recommends ESCALATE
     # ------------------------------------------------------------------
     if action == "ESCALATE":
         return PolicyDecision(
@@ -134,7 +123,7 @@ def evaluate(
         )
 
     # ------------------------------------------------------------------
-    # Rule 4 — Total recovery attempt limit
+    # Rule 3 — Total recovery attempt limit
     # Applies before action-specific checks.
     # ------------------------------------------------------------------
     if ctx.previous_recovery_attempts >= MAX_RECOVERY_ATTEMPTS:
@@ -149,7 +138,7 @@ def evaluate(
         )
 
     # ------------------------------------------------------------------
-    # Rule 5 — PAYMENT_RETRY
+    # Rule 4 — PAYMENT_RETRY
     # ------------------------------------------------------------------
     if action == "PAYMENT_RETRY":
         if ctx.previous_retry_count >= MAX_PAYMENT_RETRIES:
@@ -172,7 +161,7 @@ def evaluate(
         )
 
     # ------------------------------------------------------------------
-    # Rule 6 — SEND_REMINDER
+    # Rule 5 — SEND_REMINDER
     # ------------------------------------------------------------------
     if action == "SEND_REMINDER":
         if ctx.previous_reminder_count >= MAX_REMINDERS:

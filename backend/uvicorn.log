@@ -1,2 +1,6 @@
 
 c:\Users\Uchiha Sasuke\Desktop\RecoveryOS\backend>".venv\Scripts\uvicorn.exe" app.main:app --port 8000  
+INFO:     Started server process [6048]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)

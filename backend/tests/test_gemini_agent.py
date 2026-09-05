@@ -264,13 +264,22 @@ def test_missing_api_key_raises_error(valid_context):
 
 
 # ---------------------------------------------------------------------------
-# 10. All four valid actions are accepted by RecoveryRecommendation
+# 10. All three valid actions are accepted by RecoveryRecommendation
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("action", ["PAYMENT_RETRY", "SEND_REMINDER", "ESCALATE", "STOP"])
+@pytest.mark.parametrize("action", ["PAYMENT_RETRY", "SEND_REMINDER", "ESCALATE"])
 def test_all_valid_actions_accepted(action):
     rec = RecoveryRecommendation(action=action, reason="test", confidence=0.5)
     assert rec.action == action
+
+
+# ---------------------------------------------------------------------------
+# 10b. STOP is no longer a valid Gemini action
+# ---------------------------------------------------------------------------
+
+def test_stop_action_rejected():
+    with pytest.raises(Exception):
+        RecoveryRecommendation(action="STOP", reason="test", confidence=0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -313,3 +322,51 @@ def test_negative_recovery_count_rejected():
             previous_retry_count=0,
             previous_reminder_count=0,
         )
+
+
+# ---------------------------------------------------------------------------
+# 14. Gemini returns ESCALATE — accepted and passed through
+# ---------------------------------------------------------------------------
+
+def test_escalate_response_accepted(valid_context):
+    escalate_payload = {
+        "action": "ESCALATE",
+        "reason": "Both probabilities are weak and recovery history is poor.",
+        "confidence": 0.55,
+    }
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.return_value = _make_mock_response(
+        escalate_payload
+    )
+
+    agent = GeminiRecoveryAgent()
+    agent._client = mock_client
+
+    result = agent.recommend(valid_context)
+
+    assert isinstance(result, RecoveryRecommendation)
+    assert result.action == "ESCALATE"
+    assert result.confidence == 0.55
+
+
+# ---------------------------------------------------------------------------
+# 15. Prompt contains ESCALATE action definition
+# ---------------------------------------------------------------------------
+
+def test_prompt_contains_escalate_definition(valid_context):
+    prompt = _build_prompt(valid_context)
+    assert "ESCALATE" in prompt
+    # Prompt must explain what ESCALATE means
+    assert "human" in prompt.lower() or "manual" in prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# 16. Prompt contains all three action names
+# ---------------------------------------------------------------------------
+
+def test_prompt_contains_all_three_actions(valid_context):
+    prompt = _build_prompt(valid_context)
+    assert "PAYMENT_RETRY" in prompt
+    assert "SEND_REMINDER" in prompt
+    assert "ESCALATE" in prompt
