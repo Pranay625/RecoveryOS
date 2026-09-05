@@ -106,6 +106,8 @@ def build_inference_features(
 
     # ------------------------------------------------------------------
     # Existing customer — query historical records before cutoff
+    # Runtime payments (PAY_RT_*) are excluded: they are execution/demo
+    # state and must never contaminate historical ML features.
     # ------------------------------------------------------------------
     prior_payments: list[Payment] = (
         db.query(Payment)
@@ -113,6 +115,7 @@ def build_inference_features(
             and_(
                 Payment.customer_id == customer_id,
                 Payment.created_at < as_of,
+                ~Payment.payment_id.like("PAY_RT_%"),
             )
         )
         .order_by(Payment.created_at)

@@ -1,5 +1,5 @@
 """
-RecoveryOS - Phase 8: Razorpay Service
+RecoveryOS - Phase 8/9: Razorpay Service
 
 Responsible ONLY for communication with the Razorpay API.
 
@@ -7,6 +7,7 @@ This module:
   - Reads credentials from app settings (never hardcoded).
   - Initialises the Razorpay client lazily (no network call on import).
   - Exposes create_order() for creating a Razorpay Test Mode Order.
+  - Exposes verify_payment_signature() for server-side Checkout verification.
   - Converts rupee amounts to paise (smallest INR unit) before sending.
   - Returns the raw Razorpay order dict for the caller to use.
 
@@ -141,6 +142,47 @@ class RazorpayService:
         except (KeyError, TypeError) as exc:
             raise RazorpayServiceError(
                 f"Unexpected Razorpay order response shape: {exc}"
+            ) from exc
+
+    def verify_payment_signature(
+        self,
+        razorpay_order_id: str,
+        razorpay_payment_id: str,
+        razorpay_signature: str,
+    ) -> None:
+        """
+        Verify the Razorpay Checkout payment signature server-side.
+
+        Uses the Razorpay SDK's utility.verify_payment_signature() which
+        performs a local HMAC-SHA256 check — no network call is made.
+
+        Args:
+            razorpay_order_id:   The order ID returned by create_order().
+            razorpay_payment_id: The payment ID returned by Razorpay Checkout.
+            razorpay_signature:  The signature returned by Razorpay Checkout.
+
+        Returns:
+            None on success.
+
+        Raises:
+            RazorpayServiceError: if the signature is invalid or verification
+                                  fails for any reason.  The key secret is
+                                  never included in the error message.
+        """
+        client = self._get_client()
+        params = {
+            "razorpay_order_id":   razorpay_order_id,
+            "razorpay_payment_id": razorpay_payment_id,
+            "razorpay_signature":  razorpay_signature,
+        }
+        try:
+            client.utility.verify_payment_signature(params)
+        except Exception as exc:
+            # The SDK raises SignatureVerificationError on mismatch.
+            # We catch all exceptions to avoid leaking SDK internals or
+            # credentials in the error message.
+            raise RazorpayServiceError(
+                f"Payment signature verification failed: {type(exc).__name__}"
             ) from exc
 
 
