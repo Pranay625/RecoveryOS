@@ -1,9 +1,9 @@
 """
-RecoveryOS — Phase 5: Gemini Agent Manual Test
+RecoveryOS — Phase 5: Groq Agent Manual Test
 
-Makes a REAL Gemini API call using GEMINI_API_KEY from the environment.
+Makes a REAL Groq API call using GROQ_API_KEY from the environment.
 
-Run from backend/:
+Run from backend:
     python -m scripts.test_gemini_agent
 """
 
@@ -22,24 +22,18 @@ from app.services.gemini_agent import (
 
 
 def main():
-    # ------------------------------------------------------------------
-    # Guard: fail cleanly if API key is missing
-    # ------------------------------------------------------------------
-    if not settings.GEMINI_API_KEY:
+    if not settings.GROQ_API_KEY:
         print(
-            "ERROR: GEMINI_API_KEY is not set.\n"
+            "ERROR: GROQ_API_KEY is not set.\n"
             "Add it to your .env file:\n"
-            "    GEMINI_API_KEY=your_key_here"
+            "    GROQ_API_KEY=your_key_here"
         )
         sys.exit(1)
 
     print("=" * 55)
-    print("  RecoveryOS — Gemini Agent Manual Test")
+    print("  RecoveryOS — Groq Agent Manual Test")
     print("=" * 55)
 
-    # ------------------------------------------------------------------
-    # Sample recovery case (as specified in Phase 5 requirements)
-    # ------------------------------------------------------------------
     ctx = RecoveryContext(
         payment=PaymentContext(
             amount=2499,
@@ -64,37 +58,34 @@ def main():
         ),
     )
 
-    print("\nSending recovery context to Gemini...")
+    print("\nSending recovery context to Groq...")
     print(f"  Payment  : INR {ctx.payment.amount} via {ctx.payment.payment_method}")
     print(f"  Failure  : {ctx.payment.failure_reason}")
-    print(f"  XGBoost  : RETRY={ctx.ml_predictions.PAYMENT_RETRY}  "
-          f"REMINDER={ctx.ml_predictions.SEND_REMINDER}")
+    print(
+        f"  XGBoost  : RETRY={ctx.ml_predictions.PAYMENT_RETRY}  "
+        f"REMINDER={ctx.ml_predictions.SEND_REMINDER}"
+    )
 
-    # ------------------------------------------------------------------
-    # Call the agent
-    # ------------------------------------------------------------------
     try:
         agent = GeminiRecoveryAgent()
         recommendation = agent.recommend(ctx)
     except GeminiAgentError as exc:
-        print(f"\nGemini agent error: {exc}")
+        print(f"\nGroq agent error: {exc}")
         sys.exit(1)
 
-    # ------------------------------------------------------------------
-    # Print result
-    # ------------------------------------------------------------------
-    print("\nGemini Recovery Recommendation:")
+    print("\nGroq Recovery Recommendation:")
     print(json.dumps(recommendation.model_dump(), indent=4))
 
-    # ------------------------------------------------------------------
-    # Basic sanity assertions
-    # ------------------------------------------------------------------
     assert recommendation.action in (
-        "PAYMENT_RETRY", "SEND_REMINDER", "ESCALATE", "STOP"
+        "PAYMENT_RETRY",
+        "SEND_REMINDER",
+        "ESCALATE",
     ), f"Unexpected action: {recommendation.action}"
+
     assert 0.0 <= recommendation.confidence <= 1.0, (
         f"Confidence out of range: {recommendation.confidence}"
     )
+
     assert len(recommendation.reason) > 0, "Reason is empty"
 
     print("\n  All assertions passed.")

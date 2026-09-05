@@ -1,8 +1,8 @@
 """
-RecoveryOS — Phase 5: Gemini Recovery Agent
+RecoveryOS — LLM Recovery Agent (Groq)
 
 Accepts a validated payment/customer context plus XGBoost probabilities,
-sends them to Gemini with a structured-output schema, and returns a
+sends them to the Groq API with a structured JSON prompt, and returns a
 validated recovery recommendation.
 
 This module is intentionally independent from app/ml/predict.py.
@@ -12,9 +12,12 @@ XGBoost probabilities as part of the request context.
 Flow:
     RecoveryContext (Pydantic)
         ↓
-    GeminiRecoveryAgent.recommend()
+    GeminiRecoveryAgent.recommend()   ← name kept for import compatibility
         ↓
     RecoveryRecommendation (Pydantic)
+
+Public names are unchanged so that all existing imports, tests, and the
+router continue to work without modification.
 """
 
 from __future__ import annotations
@@ -25,28 +28,29 @@ from pydantic import BaseModel, Field
 
 from app.core.config import settings
 
+
 # ---------------------------------------------------------------------------
 # Application-level exception
 # ---------------------------------------------------------------------------
 
 class GeminiAgentError(Exception):
     """
-    Raised for any failure in the Gemini recovery agent:
+    Raised for any failure in the LLM recovery agent:
         - missing API key
         - network / API error
         - empty or invalid response
         - structured-output validation failure
+
+    Name kept as GeminiAgentError for import compatibility.
     """
 
 
 # ---------------------------------------------------------------------------
-# Gemini model selection
+# Model selection
 # ---------------------------------------------------------------------------
 
-# gemini-3.6-flash is the current stable Flash model supported by the
-# google-genai SDK and available on the free tier as of mid-2025.
-# Model name sourced directly from the live API error response.
-GEMINI_MODEL = "gemini-3.6-flash"
+GROQ_MODEL = "openai/gpt-oss-20b"
+
 
 # ---------------------------------------------------------------------------
 # System instruction
@@ -97,21 +101,40 @@ details, or customer history.
 8. Consider the complete supplied context when choosing an action.
 9. When the evidence is ambiguous or insufficient, prefer ESCALATE rather \
 than inventing certainty.
-10. Return only the structured decision.
+10. Return ONLY valid JSON matching this exact schema — no markdown, no prose:
+    {"action": "<PAYMENT_RETRY|SEND_REMINDER|ESCALATE>", "reason": "<string>", "confidence": <float 0-1>}
 11. You are making a recommendation only. A separate deterministic policy \
 engine will later determine whether the recommendation is permitted.\
 """
+
 
 # ---------------------------------------------------------------------------
 # Request models
 # ---------------------------------------------------------------------------
 
 class PaymentContext(BaseModel):
-    amount: float = Field(..., gt=0, description="Payment amount in the given currency")
-    currency: str = Field(..., description="Currency code, e.g. INR")
-    payment_method: str = Field(..., description="e.g. upi, card, netbanking, wallet")
-    failure_reason: str = Field(..., description="Reason the payment failed")
-    attempt_number: int = Field(..., ge=1, description="Which attempt this is")
+    amount: float = Field(
+        ...,
+        gt=0,
+        description="Payment amount in the given currency",
+    )
+    currency: str = Field(
+        ...,
+        description="Currency code, e.g. INR",
+    )
+    payment_method: str = Field(
+        ...,
+        description="e.g. upi, card, netbanking, wallet",
+    )
+    failure_reason: str = Field(
+        ...,
+        description="Reason the payment failed",
+    )
+    attempt_number: int = Field(
+        ...,
+        ge=1,
+        description="Which attempt this is",
+    )
 
 
 class CustomerHistory(BaseModel):
@@ -119,7 +142,9 @@ class CustomerHistory(BaseModel):
     success_rate: float = Field(..., ge=0.0, le=1.0)
     average_transaction_amount: float = Field(..., ge=0.0)
     days_since_last_success: int = Field(
-        ..., ge=-1, description="-1 means no prior successful payment"
+        ...,
+        ge=-1,
+        description="-1 means no prior successful payment",
     )
     previous_recovery_attempts: int = Field(..., ge=0)
     recovery_success_rate: float = Field(..., ge=0.0, le=1.0)
@@ -142,7 +167,11 @@ class RecoveryContext(BaseModel):
 # Response model
 # ---------------------------------------------------------------------------
 
-RecoveryAction = Literal["PAYMENT_RETRY", "SEND_REMINDER", "ESCALATE"]
+RecoveryAction = Literal[
+    "PAYMENT_RETRY",
+    "SEND_REMINDER",
+    "ESCALATE",
+]
 
 
 class RecoveryRecommendation(BaseModel):
@@ -156,7 +185,7 @@ class RecoveryRecommendation(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _build_prompt(ctx: RecoveryContext) -> str:
-    p  = ctx.payment
+    p = ctx.payment
     ch = ctx.customer_history
     ml = ctx.ml_predictions
 
@@ -173,8 +202,7 @@ Attempt number  : {p.attempt_number}
 Total previous transactions     : {ch.total_previous_transactions}
 Historical success rate         : {ch.success_rate:.4f}
 Average transaction amount      : {ch.average_transaction_amount:.2f} {p.currency}
-Days since last success         : {ch.days_since_last_success} \
-(-1 = no prior success)
+Days since last success         : {ch.days_since_last_success} (-1 = no prior success)
 Previous recovery attempts      : {ch.previous_recovery_attempts}
 Recovery success rate           : {ch.recovery_success_rate:.4f}
 Previous PAYMENT_RETRY count    : {ch.previous_retry_count}
@@ -187,14 +215,22 @@ P(success | SEND_REMINDER)  : {ml.SEND_REMINDER:.4f}
 === AVAILABLE ACTIONS ===
 PAYMENT_RETRY  - recommend another automated payment retry
 SEND_REMINDER  - recommend contacting/reminding the customer
-ESCALATE       - recommend human/manual intervention instead of another \
-automated recovery action
+ESCALATE       - recommend human/manual intervention instead of another automated recovery action
 
 Choose ESCALATE if the recovery history is poor, probabilities are weak \
 (below ~0.5), repeated attempts have failed, or human judgement is needed.
 
 Based on the above, recommend the single best recovery action.
-Return a structured response with action, reason, and confidence.\
+
+Return ONLY valid JSON with exactly these three keys:
+action
+reason
+confidence
+
+The JSON must have this structure:
+{{"action": "PAYMENT_RETRY", "reason": "your explanation", "confidence": 0.95}}
+
+Do not include markdown, code fences, or any additional text.
 """
 
 
@@ -204,7 +240,10 @@ Return a structured response with action, reason, and confidence.\
 
 class GeminiRecoveryAgent:
     """
-    Wraps the google-genai client and exposes a single recommend() method.
+    Wraps the Groq client and exposes a single recommend() method.
+
+    Class name kept as GeminiRecoveryAgent for import compatibility with
+    the router and all existing tests.
 
     The client is instantiated lazily so that import-time failures only
     occur when the agent is actually used, not when the module is imported.
@@ -217,69 +256,95 @@ class GeminiRecoveryAgent:
         if self._client is not None:
             return self._client
 
-        api_key = settings.GEMINI_API_KEY
+        api_key = settings.GROQ_API_KEY
+
         if not api_key:
             raise GeminiAgentError(
-                "GEMINI_API_KEY is not set. "
-                "Add it to your .env file before using the Gemini agent."
+                "GROQ_API_KEY is not set. "
+                "Add it to your .env file before using the LLM agent."
             )
 
         try:
-            from google import genai  # noqa: PLC0415
+            from groq import Groq  # noqa: PLC0415
         except ImportError as exc:
             raise GeminiAgentError(
-                "google-genai package is not installed. "
-                "Run: pip install google-genai"
+                "groq package is not installed. "
+                "Run: pip install groq"
             ) from exc
 
-        self._client = genai.Client(api_key=api_key)
+        self._client = Groq(api_key=api_key)
+
         return self._client
 
-    def recommend(self, ctx: RecoveryContext) -> RecoveryRecommendation:
+    def recommend(
+        self,
+        ctx: RecoveryContext,
+    ) -> RecoveryRecommendation:
         """
-        Send the recovery context to Gemini and return a validated
+        Send the recovery context to Groq and return a validated
         RecoveryRecommendation.
 
         Raises:
             GeminiAgentError — for any API, network, or validation failure.
         """
+
         client = self._get_client()
         prompt = _build_prompt(ctx)
 
         try:
-            from google.genai import types  # noqa: PLC0415
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": _SYSTEM_INSTRUCTION,
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                ],
+                temperature=0.2,
 
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=_SYSTEM_INSTRUCTION,
-                    response_mime_type="application/json",
-                    response_schema=RecoveryRecommendation,
-                    # Disable tool use — the agent must not call external APIs
-                    tools=[],
-                ),
+                # GPT-OSS is a reasoning model. Disable reasoning so that
+                # the response content contains our JSON recommendation.
+                include_reasoning=False,
+
+                # Give the model enough completion space for the JSON
+                # response while keeping the response small.
+                max_completion_tokens=512,
+
+                # Ask Groq for JSON output.
+                response_format={
+                    "type": "json_object"
+                },
             )
-        except GeminiAgentError:
-            raise
+
         except Exception as exc:
             raise GeminiAgentError(
-                f"Gemini API request failed: {exc}"
+                f"Groq API request failed: {exc}"
             ) from exc
 
-        # Extract and validate the structured response
-        raw = getattr(response, "text", None)
+        raw = (
+            response.choices[0].message.content
+            if response.choices
+            else None
+        )
+
         if not raw:
             raise GeminiAgentError(
-                "Gemini returned an empty response. "
+                "Groq returned an empty response. "
                 "Check your API key and model availability."
             )
 
+        raw = raw.strip()
+
         try:
             recommendation = RecoveryRecommendation.model_validate_json(raw)
+
         except Exception as exc:
             raise GeminiAgentError(
-                f"Gemini response failed Pydantic validation: {exc}\n"
+                f"Groq response failed Pydantic validation: {exc}\n"
                 f"Raw response: {raw!r}"
             ) from exc
 

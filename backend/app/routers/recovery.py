@@ -185,18 +185,18 @@ def _run_decision_pipeline(
         ),
     )
 
-    # 5. Gemini recommendation
+    # 5. LLM recommendation (Groq)
     try:
         recommendation = _get_agent().recommend(ctx)
     except GeminiAgentError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Gemini agent error: {exc}",
+            detail=f"LLM agent error: {exc}",
         )
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Unexpected error during Gemini inference: {exc}",
+            detail=f"Unexpected error during LLM inference: {exc}",
         )
 
     # 6. Deterministic policy engine

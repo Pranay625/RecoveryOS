@@ -8,6 +8,6 @@ pandas
 xgboost
 scikit-learn
 joblib
-google-genai
+groq
 razorpay
 pytest

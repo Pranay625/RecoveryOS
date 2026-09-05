@@ -1,7 +1,7 @@
 """
-Phase 5 unit tests — Gemini Recovery Agent.
+Unit tests — LLM Recovery Agent (Groq).
 
-All tests mock the Gemini client. No real API calls are made.
+All tests mock the Groq client. No real API calls are made.
 
 Run from backend/:
     pytest tests/test_gemini_agent.py -v
@@ -55,11 +55,20 @@ def valid_context() -> RecoveryContext:
     )
 
 
-def _make_mock_response(payload: dict) -> MagicMock:
-    """Return a mock that looks like a google-genai response object."""
-    mock_resp = MagicMock()
-    mock_resp.text = json.dumps(payload)
-    return mock_resp
+def _make_mock_client(payload: dict) -> MagicMock:
+    """Return a mock Groq client whose chat.completions.create() returns payload."""
+    mock_message = MagicMock()
+    mock_message.content = json.dumps(payload)
+
+    mock_choice = MagicMock()
+    mock_choice.message = mock_message
+
+    mock_response = MagicMock()
+    mock_response.choices = [mock_choice]
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = mock_response
+    return mock_client
 
 
 # ---------------------------------------------------------------------------
@@ -76,20 +85,15 @@ def test_valid_response_accepted(valid_context):
         "confidence": 0.91,
     }
 
-    mock_client = MagicMock()
-    mock_client.models.generate_content.return_value = _make_mock_response(
-        valid_payload
-    )
-
     agent = GeminiRecoveryAgent()
-    agent._client = mock_client
+    agent._client = _make_mock_client(valid_payload)
 
     result = agent.recommend(valid_context)
 
     assert isinstance(result, RecoveryRecommendation)
     assert result.action == "PAYMENT_RETRY"
     assert result.confidence == 0.91
-    assert "retry" in result.reason.lower() or len(result.reason) > 0
+    assert len(result.reason) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -103,13 +107,8 @@ def test_invalid_action_rejected(valid_context):
         "confidence": 0.9,
     }
 
-    mock_client = MagicMock()
-    mock_client.models.generate_content.return_value = _make_mock_response(
-        invalid_payload
-    )
-
     agent = GeminiRecoveryAgent()
-    agent._client = mock_client
+    agent._client = _make_mock_client(invalid_payload)
 
     with pytest.raises(GeminiAgentError, match="validation"):
         agent.recommend(valid_context)
@@ -126,13 +125,8 @@ def test_confidence_below_zero_rejected(valid_context):
         "confidence": -0.1,
     }
 
-    mock_client = MagicMock()
-    mock_client.models.generate_content.return_value = _make_mock_response(
-        invalid_payload
-    )
-
     agent = GeminiRecoveryAgent()
-    agent._client = mock_client
+    agent._client = _make_mock_client(invalid_payload)
 
     with pytest.raises(GeminiAgentError, match="validation"):
         agent.recommend(valid_context)
@@ -149,13 +143,8 @@ def test_confidence_above_one_rejected(valid_context):
         "confidence": 1.5,
     }
 
-    mock_client = MagicMock()
-    mock_client.models.generate_content.return_value = _make_mock_response(
-        invalid_payload
-    )
-
     agent = GeminiRecoveryAgent()
-    agent._client = mock_client
+    agent._client = _make_mock_client(invalid_payload)
 
     with pytest.raises(GeminiAgentError, match="validation"):
         agent.recommend(valid_context)
@@ -181,66 +170,63 @@ def test_prompt_contains_context_fields(valid_context):
 
 
 # ---------------------------------------------------------------------------
-# 6. Structured response schema is passed to Gemini
+# 6. Groq client is called with the correct model name
 # ---------------------------------------------------------------------------
 
-def test_structured_schema_passed_to_gemini(valid_context):
+def test_correct_model_passed_to_groq(valid_context):
     valid_payload = {
         "action": "SEND_REMINDER",
         "reason": "Low retry probability.",
         "confidence": 0.72,
     }
 
-    mock_client = MagicMock()
-    mock_client.models.generate_content.return_value = _make_mock_response(
-        valid_payload
-    )
-
     agent = GeminiRecoveryAgent()
-    agent._client = mock_client
+    agent._client = _make_mock_client(valid_payload)
 
     agent.recommend(valid_context)
 
-    call_kwargs = mock_client.models.generate_content.call_args
-    config = call_kwargs.kwargs.get("config") or call_kwargs.args[2] if call_kwargs.args else None
-
-    # Verify generate_content was called with a config argument
-    assert mock_client.models.generate_content.called
-    # Verify the model name was passed
-    call_args = mock_client.models.generate_content.call_args
-    assert GEMINI_MODEL_NAME_CHECK in str(call_args)
+    call_kwargs = agent._client.chat.completions.create.call_args
+    assert call_kwargs is not None
+    # Model name must be the Groq model
+    assert GROQ_MODEL_NAME_CHECK in str(call_kwargs)
 
 
-GEMINI_MODEL_NAME_CHECK = "gemini-3.6-flash"
+GROQ_MODEL_NAME_CHECK = "openai/gpt-oss-20b"
 
 
 # ---------------------------------------------------------------------------
-# 7. Gemini API failure is converted to GeminiAgentError
+# 7. Groq API failure is converted to GeminiAgentError
 # ---------------------------------------------------------------------------
 
 def test_api_failure_raises_gemini_agent_error(valid_context):
     mock_client = MagicMock()
-    mock_client.models.generate_content.side_effect = RuntimeError(
+    mock_client.chat.completions.create.side_effect = RuntimeError(
         "Connection timeout"
     )
 
     agent = GeminiRecoveryAgent()
     agent._client = mock_client
 
-    with pytest.raises(GeminiAgentError, match="Gemini API request failed"):
+    with pytest.raises(GeminiAgentError, match="Groq API request failed"):
         agent.recommend(valid_context)
 
 
 # ---------------------------------------------------------------------------
-# 8. Empty Gemini response raises GeminiAgentError
+# 8. Empty Groq response raises GeminiAgentError
 # ---------------------------------------------------------------------------
 
 def test_empty_response_raises_error(valid_context):
-    mock_resp = MagicMock()
-    mock_resp.text = ""
+    mock_message = MagicMock()
+    mock_message.content = ""
+
+    mock_choice = MagicMock()
+    mock_choice.message = mock_message
+
+    mock_response = MagicMock()
+    mock_response.choices = [mock_choice]
 
     mock_client = MagicMock()
-    mock_client.models.generate_content.return_value = mock_resp
+    mock_client.chat.completions.create.return_value = mock_response
 
     agent = GeminiRecoveryAgent()
     agent._client = mock_client
@@ -250,7 +236,7 @@ def test_empty_response_raises_error(valid_context):
 
 
 # ---------------------------------------------------------------------------
-# 9. Missing GEMINI_API_KEY raises GeminiAgentError
+# 9. Missing GROQ_API_KEY raises GeminiAgentError
 # ---------------------------------------------------------------------------
 
 def test_missing_api_key_raises_error(valid_context):
@@ -258,8 +244,8 @@ def test_missing_api_key_raises_error(valid_context):
     # _client is None — will attempt to build it from settings
 
     with patch("app.services.gemini_agent.settings") as mock_settings:
-        mock_settings.GEMINI_API_KEY = ""
-        with pytest.raises(GeminiAgentError, match="GEMINI_API_KEY"):
+        mock_settings.GROQ_API_KEY = ""
+        with pytest.raises(GeminiAgentError, match="GROQ_API_KEY"):
             agent.recommend(valid_context)
 
 
@@ -274,7 +260,7 @@ def test_all_valid_actions_accepted(action):
 
 
 # ---------------------------------------------------------------------------
-# 10b. STOP is no longer a valid Gemini action
+# 10b. STOP is no longer a valid LLM action
 # ---------------------------------------------------------------------------
 
 def test_stop_action_rejected():
@@ -325,7 +311,7 @@ def test_negative_recovery_count_rejected():
 
 
 # ---------------------------------------------------------------------------
-# 14. Gemini returns ESCALATE — accepted and passed through
+# 14. Groq returns ESCALATE — accepted and passed through
 # ---------------------------------------------------------------------------
 
 def test_escalate_response_accepted(valid_context):
@@ -335,13 +321,8 @@ def test_escalate_response_accepted(valid_context):
         "confidence": 0.55,
     }
 
-    mock_client = MagicMock()
-    mock_client.models.generate_content.return_value = _make_mock_response(
-        escalate_payload
-    )
-
     agent = GeminiRecoveryAgent()
-    agent._client = mock_client
+    agent._client = _make_mock_client(escalate_payload)
 
     result = agent.recommend(valid_context)
 
