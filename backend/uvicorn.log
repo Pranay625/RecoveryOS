@@ -1,0 +1,2 @@
+
+c:\Users\Uchiha Sasuke\Desktop\RecoveryOS\backend>".venv\Scripts\uvicorn.exe" app.main:app --port 8000  

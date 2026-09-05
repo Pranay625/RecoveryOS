@@ -8,3 +8,5 @@ pandas
 xgboost
 scikit-learn
 joblib
+google-genai
+pytest
