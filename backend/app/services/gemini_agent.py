@@ -312,7 +312,7 @@ class GeminiRecoveryAgent:
 
                 # Give the model enough completion space for the JSON
                 # response while keeping the response small.
-                max_completion_tokens=512,
+                max_completion_tokens=2048,
 
                 # Ask Groq for JSON output.
                 response_format={
